@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,8 +66,9 @@ type mux struct {
 	maxp     int
 	maxm     int
 
-	usePool bool
-	optIn   bool
+	usePool         bool
+	optIn           bool
+	unblockOnCancel bool
 }
 
 func makeMux(dst string, option *ClientOption, dialFn dialFn) *mux {
@@ -99,8 +101,9 @@ func newMux(dst string, option *ClientOption, init, dead wire, wireFn wireFn, wi
 		maxp:     runtime.GOMAXPROCS(0),
 		maxm:     option.BlockingPipeline,
 
-		usePool: option.DisableAutoPipelining,
-		optIn:   isOptIn(option.ClientTrackingOptions),
+		usePool:         option.DisableAutoPipelining,
+		optIn:           isOptIn(option.ClientTrackingOptions),
+		unblockOnCancel: option.UnblockOnCancel,
 	}
 	m.clhks.Store(emptyclhks)
 	for i := 0; i < len(m.muxwires); i++ {
@@ -266,11 +269,44 @@ block:
 func (m *mux) blocking(pool *pool, ctx context.Context, cmd Completed) (resp RedisResult) {
 	wire := pool.Acquire(ctx)
 	resp = wire.Do(ctx, cmd)
-	if resp.NonRedisError() != nil { // abort the wire if blocking command return early (ex. context.DeadlineExceeded)
+	if err := resp.NonRedisError(); err != nil { // abort the wire if blocking command return early (ex. context.DeadlineExceeded)
+		// try to unblock the wire if the blocking command has a context error. See https://github.com/redis/rueidis/issues/897
+		if id, ok := m.unblockable(wire, cmd, err); ok {
+			go func() {
+				if !m.unblock(id) {
+					wire.Close()
+				}
+				pool.Store(wire)
+			}()
+			return resp
+		}
 		wire.Close()
 	}
 	pool.Store(wire)
 	return resp
+}
+
+func (m *mux) unblockable(w wire, cmd Completed, err error) (id int64, ok bool) {
+	if !m.unblockOnCancel || !cmd.IsBlock() {
+		return 0, false
+	}
+	if err != context.Canceled && err != context.DeadlineExceeded {
+		return 0, false
+	}
+	if w.Error() != nil { // the wire is already closed
+		return 0, false
+	}
+	idm, ok := w.Info()["id"] // the client id is returned by HELLO
+	if !ok {
+		return 0, false
+	}
+	id, e := idm.AsInt64()
+	return id, e == nil
+}
+
+func (m *mux) unblock(id int64) bool {
+	n, err := m.pipeline(context.Background(), cmds.NewCompleted([]string{"CLIENT", "UNBLOCK", strconv.FormatInt(id, 10)})).AsInt64()
+	return err == nil && n == 1
 }
 
 func (m *mux) blockingMulti(pool *pool, ctx context.Context, cmd []Completed) (resp *redisresults) {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1168,4 +1169,72 @@ func TestNegativeConnWriteTimeoutKeepalive(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.Close()
+}
+
+func TestUnblockOnCancelReusesBlockingConn(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	defer ShouldNotLeak(SetupLeakDetection())
+	client, err := NewClient(ClientOption{
+		InitAddress:           []string{"127.0.0.1:6379"},
+		DisableAutoPipelining: true,
+		UnblockOnCancel:       true,
+		BlockingPoolSize:      1, // the next blocking cmd must wait for the unblocked conn instead of dialing a new one
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	blockingConnID := func() int64 {
+		id, err := client.Do(context.Background(), client.B().Arbitrary("CLIENT", "ID").Blocking().ToPipe()).AsInt64()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	id := blockingConnID()
+	client.Do(context.Background(), client.B().Del().Key("unblock_on_cancel").Build())
+
+	// a deadline makes pipe.Do take the deadline path, while cancel() aborts the call deterministically
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Do(ctx, client.B().Blpop().Key("unblock_on_cancel").Timeout(5).Build().ToPipe()).Error()
+	}()
+
+	for {
+		list, err := client.Do(context.Background(), client.B().ClientList().Id().ClientId(id).Build()).ToString()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(list, "flags=b") {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("BLPOP returned before being blocked: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if got := blockingConnID(); got != id {
+		t.Fatalf("the blocking conn was not reused: got client id %d, want %d", got, id)
+	}
+
+	// the reused conn still serves blocking cmds
+	if err := client.Do(context.Background(), client.B().Lpush().Key("unblock_on_cancel").Element("v").Build()).Error(); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := client.Do(context.Background(), client.B().Blpop().Key("unblock_on_cancel").Timeout(5).Build().ToPipe()).AsStrSlice(); err != nil || len(v) != 2 || v[1] != "v" {
+		t.Fatalf("unexpected BLPOP response %v %v", v, err)
+	}
+	if got := blockingConnID(); got != id {
+		t.Fatalf("the blocking conn was not reused: got client id %d, want %d", got, id)
+	}
 }
