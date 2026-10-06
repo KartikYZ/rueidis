@@ -1238,3 +1238,67 @@ func TestUnblockOnCancelReusesBlockingConn(t *testing.T) {
 		t.Fatalf("the blocking conn was not reused: got client id %d, want %d", got, id)
 	}
 }
+
+func TestUnblockOnCancelConcurrentReplies(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	defer ShouldNotLeak(SetupLeakDetection())
+	client, err := NewClient(ClientOption{
+		InitAddress:           []string{"127.0.0.1:6379"},
+		DisableAutoPipelining: true,
+		UnblockOnCancel:       true,
+		BlockingPoolSize:      4, // fewer conns than workers, so that unblocked conns are reused across workers
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	prefix := "unblock_on_cancel_concurrent:" + strconv.Itoa(rand.Intn(100000))
+	workers, iterations := 8, 50
+
+	jobs, wait := parallel(workers)
+	for w := 0; w < workers && !t.Failed(); w++ {
+		jobs <- func() {
+			for i := 0; i < iterations && !t.Failed(); i++ {
+				key := prefix + ":" + strconv.Itoa(w) + ":" + strconv.Itoa(i)
+				val := strconv.FormatInt(rand.Int63(), 10)
+
+				// a SET/GET of a unique value checks that the late replies of aborted cmds don't go to other callers
+				if err := client.Do(ctx, client.B().Set().Key(key+":kv").Value(val).Build()).Error(); err != nil {
+					t.Errorf("unexpected SET error %v", err)
+				}
+				if v, err := client.Do(ctx, client.B().Get().Key(key+":kv").Build().ToPipe()).ToString(); err != nil || v != val {
+					t.Errorf("unexpected GET response %v %v, want %v", v, err, val)
+				}
+
+				// half of the BLPOPs have a value to pop, the rest can only be aborted by their deadline and then unblocked.
+				// the server timeout is far longer than the deadline, so a nil reply can only be a late reply of another BLPOP.
+				pushed := rand.Intn(2) == 0
+				if pushed {
+					if err := client.Do(ctx, client.B().Lpush().Key(key).Element(val).Build()).Error(); err != nil {
+						t.Errorf("unexpected LPUSH error %v", err)
+					}
+				}
+				bctx, cancel := context.WithTimeout(ctx, time.Duration(rand.Intn(5000))*time.Microsecond)
+				v, err := client.Do(bctx, client.B().Blpop().Key(key).Timeout(10).Build().ToPipe()).AsStrSlice()
+				cancel()
+				var ne net.Error // the deadline can also expire while dialing a new conn
+				if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &ne) && ne.Timeout()) && !(pushed && err == nil && len(v) == 2 && v[0] == key && v[1] == val) {
+					t.Errorf("unexpected BLPOP response %v %v, pushed %v %v", v, err, pushed, val)
+				}
+				client.Do(ctx, client.B().Del().Key(key, key+":kv").Build())
+			}
+		}
+	}
+	wait()
+
+	// every blocking conn left in the pool still replies in order
+	for range 4 {
+		if err := client.Do(ctx, client.B().Arbitrary("CLIENT", "ID").Blocking().ToPipe()).Error(); err != nil {
+			t.Fatalf("unexpected CLIENT ID error %v", err)
+		}
+	}
+}
