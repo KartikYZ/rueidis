@@ -80,6 +80,7 @@ func WithHistogramOption(histogramOption HistogramOption) Option {
 // - rueidis_dial_success: number of successful dials
 // - rueidis_dial_conns: number of active connections
 // - rueidis_dial_latency: dial latency in seconds
+// - rueidis_client_unblock: CLIENT UNBLOCK outcomes, tagged result:unblocked, result:not_blocked, or result:error
 func NewClient(clientOption rueidis.ClientOption, opts ...Option) (rueidis.Client, error) {
 	oclient, err := newClient(opts...)
 	if err != nil {
@@ -129,6 +130,17 @@ func NewClient(clientOption rueidis.ClientOption, opts ...Option) (rueidis.Clien
 	}
 
 	clientOption.DialCtxFn = trackDialing(metrics, dialTracer{Tracer: oclient.tracer, tAttrs: oclient.tAttrs}, clientOption.DialCtxFn)
+
+	unblock, err := oclient.meter.Int64Counter("rueidis_client_unblock")
+	if err != nil {
+		return nil, err
+	}
+	clientOption.OnUnblock = func(result string) {
+		recorded := make([]metric.AddOption, len(oclient.addOpts), len(oclient.addOpts)+1)
+		copy(recorded, oclient.addOpts)
+		recorded = append(recorded, metric.WithAttributes(attribute.String("result", result)))
+		unblock.Add(context.Background(), 1, recorded...)
+	}
 
 	cli, err := rueidis.NewClient(clientOption)
 	if err != nil {

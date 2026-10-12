@@ -66,8 +66,9 @@ type mux struct {
 	maxp     int
 	maxm     int
 
-	usePool bool
-	optIn   bool
+	usePool   bool
+	optIn     bool
+	onUnblock func(result string)
 }
 
 func makeMux(dst string, option *ClientOption, dialFn dialFn) *mux {
@@ -100,8 +101,9 @@ func newMux(dst string, option *ClientOption, init, dead wire, wireFn wireFn, wi
 		maxp:     runtime.GOMAXPROCS(0),
 		maxm:     option.BlockingPipeline,
 
-		usePool: option.DisableAutoPipelining,
-		optIn:   isOptIn(option.ClientTrackingOptions),
+		usePool:   option.DisableAutoPipelining,
+		optIn:     isOptIn(option.ClientTrackingOptions),
+		onUnblock: option.OnUnblock,
 	}
 	m.clhks.Store(emptyclhks)
 	for i := 0; i < len(m.muxwires); i++ {
@@ -304,6 +306,16 @@ func (m *mux) unblockable(w wire, cmd Completed, err error) (id int64, ok bool) 
 
 func (m *mux) unblock(id int64) bool {
 	n, err := m.pipeline(context.Background(), cmds.NewCompleted([]string{"CLIENT", "UNBLOCK", strconv.FormatInt(id, 10)})).AsInt64()
+	if m.onUnblock != nil {
+		switch {
+		case err != nil:
+			m.onUnblock("error")
+		case n == 1:
+			m.onUnblock("unblocked")
+		default:
+			m.onUnblock("not_blocked")
+		}
+	}
 	return err == nil && n == 1
 }
 

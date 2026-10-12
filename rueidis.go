@@ -285,6 +285,10 @@ type ClientOption struct {
 	// AZFromInfo forces the `availability_zone` field to be taken from an INFO command instead of HELLO.
 	// Primarily used for AWS MemoryDB.
 	AZFromInfo bool
+
+	// OnUnblock, if set, is called after CLIENT UNBLOCK with "unblocked" (reply 1),
+	// "not_blocked" (reply 0), or "error".
+	OnUnblock func(result string)
 }
 
 // SentinelOption contains MasterSet,
